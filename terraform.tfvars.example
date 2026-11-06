@@ -1,0 +1,14 @@
+# For local runs only: copy to terraform.tfvars. GitHub Actions uses repository
+# secrets and variables instead. Never commit terraform.tfvars.
+
+wg_server_private_key   = "CONTENTS_OF_server.key"
+wg_client_preshared_key = "CONTENTS_OF_client.psk"
+wg_client_public_key    = "CONTENTS_OF_client.pub"
+
+# Optional: SSH access to the server
+# ssh_public_key    = "ssh-ed25519 AAAA..."
+# ssh_allowed_cidrs = ["203.0.113.7/32"]
+
+# Optional: update a DuckDNS subdomain at boot
+# duckdns_domain = "my-vpn"
+# duckdns_token  = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"

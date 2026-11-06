@@ -1,0 +1,180 @@
+name: "WireGuard VPN Control (Up / Down)"
+run-name: "VPN ${{ inputs.action }} - ${{ inputs.region }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "up = deploy the VPN server, down = destroy it"
+        required: true
+        default: "up"
+        type: choice
+        options:
+          - up
+          - down
+      region:
+        description: "Country / AWS region the VPN exits from. For down, pick the region you deployed to."
+        required: true
+        default: "Switzerland (Zurich) [opt-in] - eu-central-2"
+        type: choice
+        # The workflow reads the region id after the last space of the label.
+        # [opt-in] regions must be enabled in the AWS account first.
+        options:
+          - "Australia (Melbourne) [opt-in] - ap-southeast-4"
+          - "Australia (Sydney) - ap-southeast-2"
+          - "Brazil (Sao Paulo) - sa-east-1"
+          - "Canada (Calgary) [opt-in] - ca-west-1"
+          - "Canada (Montreal) - ca-central-1"
+          - "France (Paris) - eu-west-3"
+          - "Germany (Frankfurt) - eu-central-1"
+          - "Hong Kong [opt-in] - ap-east-1"
+          - "India (Hyderabad) [opt-in] - ap-south-2"
+          - "India (Mumbai) - ap-south-1"
+          - "Indonesia (Jakarta) [opt-in] - ap-southeast-3"
+          - "Ireland (Dublin) - eu-west-1"
+          - "Israel (Tel Aviv) [opt-in] - il-central-1"
+          - "Italy (Milan) [opt-in] - eu-south-1"
+          - "Japan (Osaka) - ap-northeast-3"
+          - "Japan (Tokyo) - ap-northeast-1"
+          - "Malaysia (Kuala Lumpur) [opt-in] - ap-southeast-5"
+          - "Mexico (Queretaro) [opt-in] - mx-central-1"
+          - "New Zealand (Auckland) [opt-in] - ap-southeast-6"
+          - "Singapore - ap-southeast-1"
+          - "South Africa (Cape Town) [opt-in] - af-south-1"
+          - "South Korea (Seoul) - ap-northeast-2"
+          - "Spain (Madrid) [opt-in] - eu-south-2"
+          - "Sweden (Stockholm) - eu-north-1"
+          - "Switzerland (Zurich) [opt-in] - eu-central-2"
+          - "Taiwan (Taipei) [opt-in] - ap-east-2"
+          - "Thailand (Bangkok) [opt-in] - ap-southeast-7"
+          - "UAE (Dubai) [opt-in] - me-central-1"
+          - "UK (London) - eu-west-2"
+          - "USA (N. California) - us-west-1"
+          - "USA (Ohio) - us-east-2"
+          - "USA (Oregon) - us-west-2"
+          - "USA (N. Virginia) - us-east-1"
+
+# One run at a time per region; each region has its own state file.
+concurrency:
+  group: wireguard-vpn-${{ inputs.region }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  vpn:
+    name: "VPN ${{ inputs.action == 'up' && '🟢 UP (Deploy)' || '🔴 DOWN (Destroy)' }}"
+    runs-on: ubuntu-latest
+    env:
+      # Personal settings live in repository secrets and variables (see README).
+      TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+      TF_STATE_REGION: ${{ vars.TF_STATE_REGION }}
+      TF_VAR_wg_client_public_key: ${{ vars.WG_CLIENT_PUBLIC_KEY }}
+      TF_VAR_ssh_public_key: ${{ vars.SSH_PUBLIC_KEY }}
+      TF_VAR_ssh_allowed_cidrs: ${{ secrets.SSH_ALLOWED_CIDRS || '[]' }}
+      TF_VAR_wg_server_private_key: ${{ secrets.WG_SERVER_PRIVATE_KEY }}
+      TF_VAR_wg_client_preshared_key: ${{ secrets.WG_CLIENT_PRESHARED_KEY }}
+      TF_VAR_duckdns_domain: ${{ secrets.DUCKDNS_DOMAIN }}
+      TF_VAR_duckdns_token: ${{ secrets.DUCKDNS_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check settings and resolve AWS region
+        env:
+          REGION_CHOICE: ${{ inputs.region }}
+        run: |
+          if [ -z "${TF_STATE_BUCKET}" ] || [ -z "${TF_STATE_REGION}" ]; then
+            echo "::error::Set the TF_STATE_BUCKET secret and the TF_STATE_REGION variable (see README)."
+            exit 1
+          fi
+
+          REGION="${REGION_CHOICE##* }"
+          if ! [[ "${REGION}" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]]; then
+            echo "::error::Cannot read an AWS region from '${REGION_CHOICE}'"
+            exit 1
+          fi
+          echo "AWS_REGION=${REGION}" >> "$GITHUB_ENV"
+          echo "TF_VAR_aws_region=${REGION}" >> "$GITHUB_ENV"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: "latest"
+
+      - name: OpenTofu Init (S3 Backend)
+        run: |
+          tofu init -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="region=${TF_STATE_REGION}" \
+            -backend-config="key=wireguard-vpn/${AWS_REGION}/terraform.tfstate"
+
+      - name: "🟢 Deploy VPN Server (UP)"
+        if: ${{ inputs.action == 'up' }}
+        id: apply
+        env:
+          REGION_CHOICE: ${{ inputs.region }}
+        run: |
+          tofu apply -auto-approve -input=false
+          PUBLIC_IP=$(tofu output -raw public_ip)
+          ENDPOINT=$(tofu output -raw wireguard_endpoint)
+          INSTANCE_ID=$(tofu output -raw instance_id)
+
+          echo "public_ip=${PUBLIC_IP}" >> "$GITHUB_OUTPUT"
+          echo "endpoint=${ENDPOINT}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## 🟢 WireGuard VPN server is up"
+            echo ""
+            echo "| Parameter | Value |"
+            echo "| :--- | :--- |"
+            echo "| **Region** | ${REGION_CHOICE} |"
+            echo "| **Instance ID** | \`${INSTANCE_ID}\` |"
+            echo "| **Public IP** | \`${PUBLIC_IP}\` |"
+            echo "| **UDP port** | \`${ENDPOINT##*:}\` |"
+            echo ""
+            echo "### 📱 Endpoint for your WireGuard client"
+            echo "\`\`\`text"
+            echo "${ENDPOINT}"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "=========================================="
+          echo "VPN UP in ${AWS_REGION}! Endpoint: ${ENDPOINT}"
+          echo "=========================================="
+
+      - name: "🔴 Destroy VPN Server (DOWN)"
+        if: ${{ inputs.action == 'down' }}
+        env:
+          REGION_CHOICE: ${{ inputs.region }}
+        run: |
+          # No resources in the state usually means the wrong region was picked, so
+          # say that instead of reporting a destroy. `tofu show` exits 0 on a missing
+          # state but fails on a backend error, which must stop the step here.
+          STATE=$(tofu show -no-color)
+          if ! grep -q '^resource ' <<< "${STATE}"; then
+            echo "::warning::Nothing is deployed in ${AWS_REGION}. If a server is still running, re-run with the region it was deployed to."
+            {
+              echo "## ⚠️ Nothing to destroy in \`${AWS_REGION}\`"
+              echo ""
+              echo "If a server is still running, re-run **down** with the region it was deployed to."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          tofu destroy -auto-approve -input=false
+          {
+            echo "## 🔴 WireGuard VPN server destroyed"
+            echo ""
+            echo "All resources in ${REGION_CHOICE} were removed."
+          } >> "$GITHUB_STEP_SUMMARY"
